@@ -1,0 +1,157 @@
+name: 'Sparse Checkout'
+description: 'Checkout with sparse checkout configuration driven by YAML config'
+inputs:
+  include:
+    description: |
+      Newline-separated list of config keys to include from sparse-checkout-config.yml
+      Example: 'source' or 'source\nseed'
+    required: true
+  config-file:
+    description: 'Path to the sparse checkout config file'
+    required: false
+    default: '.github/sparse-checkout-config.yml'
+  ref:
+    description: 'The branch, tag or SHA to checkout'
+    required: false
+  fetch-depth:
+    description: 'Number of commits to fetch'
+    required: false
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Step 1 - Sparse checkout .github only
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        token: ${{ inputs.token }}
+        sparse-checkout: |
+          .github
+    
+    - name: Step 2 - Validate config file exists
+      shell: bash
+      run: |
+        config_file="${{ inputs.config-file }}"
+        if [[ ! -f "$config_file" ]]; then
+          echo "ERROR: Required config file not found: $config_file"
+          echo "Please create this file with your sparse checkout configuration"
+          exit 1
+        fi
+        echo "Config file found: $config_file"
+    
+    - name: Step 3 - Parse YAML and extract available keys
+      id: parse-yaml
+      shell: bash
+      run: |
+        config_file="${{ inputs.config-file }}"
+        
+        # Extract keys from YAML (lines that end with :)
+        available_keys=$(grep '^[a-zA-Z0-9_-]*:' "$config_file" | sed 's/:.*$//' | sort)
+        
+        echo "Available config keys:"
+        echo "$available_keys"
+        
+        # Store keys for next step
+        echo "available-keys<<EOF" >> $GITHUB_OUTPUT
+        echo "$available_keys" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
+    - name: Step 4 - Validate include list against config keys
+      shell: bash
+      run: |
+        include_list="${{ inputs.include }}"
+        available_keys="${{ steps.parse-yaml.outputs.available-keys }}"
+        
+        # Check each requested key exists
+        while IFS= read -r line; do
+          line=$(echo "$line" | xargs)  # Trim whitespace
+          
+          if [[ -z "$line" ]]; then
+            continue  # Skip empty lines
+          fi
+          
+          echo "Validating key: $line"
+          
+          if ! echo "$available_keys" | grep -q "^$line$"; then
+            echo "ERROR: Config key '$line' not found in config file"
+            echo "Available keys:"
+            echo "$available_keys"
+            exit 1
+          fi
+          
+        done <<< "$include_list"
+        
+        echo "All requested keys are valid"
+    
+    - name: Step 5 - Union directories from config values
+      id: union
+      shell: bash
+      run: |
+        include_list="${{ inputs.include }}"
+        config_file="${{ inputs.config-file }}"
+        
+        # Use associative array to track unique directories
+        declare -A unique_dirs
+        
+        # Process each line in the input
+        while IFS= read -r line; do
+          line=$(echo "$line" | xargs)  # Trim whitespace
+          
+          if [[ -z "$line" ]]; then
+            continue  # Skip empty lines
+          fi
+          
+          echo "Processing config key: $line"
+          
+          # Extract directories for this key using awk
+          # This assumes the YAML structure is:
+          # key:
+          #   - dir1
+          #   - dir2
+          dirs=$(awk "
+            /^$line:/ { in_section=1; next }
+            /^[a-zA-Z0-9_-]*:/ { in_section=0 }
+            in_section && /^[ ]*-[ ]*/ { 
+              gsub(/^[ ]*-[ ]*/, \"\"); 
+              gsub(/[ ]*$/, \"\"); 
+              if (length(\$0) > 0) print \$0 
+            }
+          " "$config_file")
+          
+          # Add each directory to unique set
+          while IFS= read -r dir; do
+            if [[ -n "$dir" ]]; then
+              unique_dirs["$dir"]=1
+              echo "  Adding: $dir"
+            fi
+          done <<< "$dirs"
+          
+        done <<< "$include_list"
+        
+        # Build the final directory list
+        final_dirs=""
+        for dir in "${!unique_dirs[@]}"; do
+          if [[ -z "$final_dirs" ]]; then
+            final_dirs="$dir"
+          else
+            final_dirs="$final_dirs"$'\n'"$dir"
+          fi
+        done
+        
+        # Sort the directories for consistency
+        final_dirs=$(echo "$final_dirs" | sort)
+        
+        echo "Final union of directories:"
+        echo "$final_dirs"
+        
+        echo "sparse-paths<<EOF" >> $GITHUB_OUTPUT
+        echo "$final_dirs" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+- name: Step 6 - Apply sparse checkout with union directories
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        sparse-checkout: ${{ steps.union.outputs.sparse-paths }}
