@@ -149,7 +149,7 @@ runs:
         echo "$final_dirs" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
 
-- name: Step 6 - Apply sparse checkout with union directories
+    - name: Step 6 - Apply sparse checkout with union directories
       uses: actions/checkout@v4
       with:
         ref: ${{ inputs.ref }}
